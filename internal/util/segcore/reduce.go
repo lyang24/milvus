@@ -46,8 +46,8 @@ type StorageCost struct {
 
 func ParseSliceInfo(originNQs []int64, originTopKs []int64, nqPerSlice int64) *SliceInfo {
 	sInfo := &SliceInfo{
-		SliceNQs:   make([]int64, 0),
-		SliceTopKs: make([]int64, 0),
+		SliceNQs:   make([]int64, 0, len(originNQs)),
+		SliceTopKs: make([]int64, 0, len(originNQs)),
 	}
 
 	if nqPerSlice == 0 {
@@ -83,7 +83,7 @@ func ReduceSearchResultsAndFillData(ctx context.Context, plan *SearchPlan, searc
 		return nil, fmt.Errorf("unaligned sliceNQs(len=%d) and sliceTopKs(len=%d)", len(sliceNQs), len(sliceTopKs))
 	}
 
-	cSearchResults := make([]C.CSearchResult, 0)
+	cSearchResults := make([]C.CSearchResult, 0, len(searchResults))
 	for _, res := range searchResults {
 		if res == nil {
 			return nil, errors.New("nil searchResult detected when reduceSearchResultsAndFillData")
