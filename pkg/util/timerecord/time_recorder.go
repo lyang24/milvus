@@ -40,9 +40,13 @@ func NewTimeRecorder(header string) *TimeRecorder {
 
 // NewTimeRecorderWithCtx creates a new TimeRecorder with context's traceID,
 func NewTimeRecorderWithTrace(ctx context.Context, header string) *TimeRecorder {
-	traceID := trace.SpanFromContext(ctx).SpanContext().TraceID()
+	ts := trace.SpanFromContext(ctx)
+	if ts.IsRecording() {
+		traceID := ts.SpanContext().TraceID()
+		header = fmt.Sprintf("%s(%s)", header, traceID)
+	}
 	return &TimeRecorder{
-		header: fmt.Sprintf("%s(%s)", header, traceID),
+		header: header,
 		start:  time.Now(),
 		last:   time.Now(),
 	}
@@ -92,12 +96,16 @@ func (tr *TimeRecorder) CtxElapse(ctx context.Context, msg string) time.Duration
 
 func (tr *TimeRecorder) printTimeRecord(ctx context.Context, msg string, span time.Duration) {
 	ts := trace.SpanFromContext(ctx)
-	ts.AddEvent(fmt.Sprintf("%s, cost %s", msg, span.String()))
-	log.Ctx(ctx).WithOptions(zap.AddCallerSkip(2)).
-		Debug(fmt.Sprintf("tr/%s", tr.header),
-			zap.String("msg", msg),
-			zap.Duration("duration", span),
-		)
+	if ts.IsRecording() {
+		ts.AddEvent(fmt.Sprintf("%s, cost %s", msg, span.String()))
+	}
+	if log.GetLevel() <= zap.DebugLevel {
+		log.Ctx(ctx).WithOptions(zap.AddCallerSkip(2)).
+			Debug(fmt.Sprintf("tr/%s", tr.header),
+				zap.String("msg", msg),
+				zap.Duration("duration", span),
+			)
+	}
 }
 
 // LongTermChecker checks we receive at least one msg in d duration. If not, checker
