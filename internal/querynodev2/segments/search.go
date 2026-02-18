@@ -18,7 +18,6 @@ package segments
 
 import (
 	"context"
-	"fmt"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -51,9 +50,9 @@ func searchSegments(ctx context.Context, mgr *Manager, segments []Segment, segTy
 		resultCh <- searchResult
 		// update metrics
 		elapsed := tr.ElapseSpan().Milliseconds()
-		metrics.QueryNodeSQSegmentLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+		metrics.QueryNodeSQSegmentLatency.WithLabelValues(paramtable.GetStringNodeID(),
 			metrics.SearchLabel, searchLabel).Observe(float64(elapsed))
-		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()),
+		metrics.QueryNodeSegmentSearchLatencyPerVector.WithLabelValues(paramtable.GetStringNodeID(),
 			metrics.SearchLabel, searchLabel).Observe(float64(elapsed) / float64(searchReq.GetNumOfQuery()))
 		return nil
 	}
