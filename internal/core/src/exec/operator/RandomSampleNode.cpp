@@ -74,20 +74,20 @@ PhyRandomSampleNode::AddInput(RowVectorPtr& input) {
     input_ = std::move(input);
 }
 
-FixedVector<uint32_t>
-PhyRandomSampleNode::FloydSample(const uint32_t N,
-                                 const uint32_t M,
+FixedVector<size_t>
+PhyRandomSampleNode::FloydSample(const size_t N,
+                                 const size_t M,
                                  std::mt19937& gen) {
-    std::unordered_set<uint32_t> selected;
+    std::unordered_set<size_t> selected;
     selected.reserve(M);
-    for (uint32_t j = N - M; j < N; ++j) {
-        std::uniform_int_distribution<uint32_t> dis(0, j);
-        uint32_t t = dis(gen);
+    for (size_t j = N - M; j < N; ++j) {
+        std::uniform_int_distribution<size_t> dis(0, j);
+        size_t t = dis(gen);
         if (!selected.insert(t).second) {
             selected.insert(j);
         }
     }
-    return FixedVector<uint32_t>(selected.begin(), selected.end());
+    return FixedVector<size_t>(selected.begin(), selected.end());
 }
 
 RowVectorPtr
@@ -165,8 +165,9 @@ PhyRandomSampleNode::GetOutput() {
             factor = 1.0 - factor;
         }
 
-        uint32_t N = active_count_;
-        uint32_t M = std::max(static_cast<uint32_t>(N * factor), 1u);
+        size_t N = active_count_;
+        size_t M = std::max(static_cast<size_t>(N * factor),
+                            static_cast<size_t>(1));
         auto& gen = GetThreadLocalGen();
 
         float epsilon = std::numeric_limits<float>::epsilon();
@@ -180,9 +181,9 @@ PhyRandomSampleNode::GetOutput() {
             }
         } else {
             // Selection sampling: write directly into bitmap
-            uint32_t remaining = N, needed = M;
-            for (uint32_t i = 0; i < N && needed > 0; ++i) {
-                if (std::uniform_int_distribution<uint32_t>(
+            size_t remaining = N, needed = M;
+            for (size_t i = 0; i < N && needed > 0; ++i) {
+                if (std::uniform_int_distribution<size_t>(
                         0, remaining - 1)(gen) < needed) {
                     data[i] = true;
                     --needed;

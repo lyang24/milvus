@@ -66,8 +66,8 @@ class PhyRandomSampleNode : public Operator {
  private:
     // Floyd's algorithm: exactly M iterations with zero collision retries.
     // Used for low sampling factors where M << N; result scattered into bitmap.
-    static FixedVector<uint32_t>
-    FloydSample(const uint32_t N, const uint32_t M, std::mt19937& gen);
+    static FixedVector<size_t>
+    FloydSample(const size_t N, const size_t M, std::mt19937& gen);
 
     float factor_{0};
     int64_t active_count_{0};
