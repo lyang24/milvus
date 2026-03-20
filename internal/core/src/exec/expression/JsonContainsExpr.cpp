@@ -329,15 +329,27 @@ PhyJsonContainsFilterExpr::ExecArrayContains(EvalCtx& context) {
     TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
+    // Single-target fast path: bypass MultiElement abstraction entirely
+    // when checking for exactly one value (typical for array_contains).
+    // Avoids variant construction, virtual dispatch, and hash/search per element.
+    const bool is_single_target = (expr_->vals_.size() == 1);
+    GetType single_target{};
+    if (is_single_target) {
+        single_target = GetValueWithCastNumber<GetType>(expr_->vals_[0]);
+    }
+
     if (!arg_inited_) {
-        arg_set_ = std::make_shared<SortVectorElement<GetType>>(expr_->vals_);
+        if (!is_single_target) {
+            arg_set_ =
+                std::make_shared<SortVectorElement<GetType>>(expr_->vals_);
+        }
         arg_inited_ = true;
     }
 
     int processed_cursor = 0;
     auto execute_sub_batch =
-        [&processed_cursor, &
-         bitmap_input ]<FilterType filter_type = FilterType::sequential>(
+        [&processed_cursor, &bitmap_input, is_single_target, &
+         single_target ]<FilterType filter_type = FilterType::sequential>(
             const milvus::ArrayView* data,
             const bool* valid_data,
             const int32_t* offsets,
@@ -353,9 +365,17 @@ PhyJsonContainsFilterExpr::ExecArrayContains(EvalCtx& context) {
         }
         auto executor = [&](size_t i) {
             const auto& array = data[i];
-            for (int j = 0; j < array.length(); ++j) {
-                if (elements->In(array.template get_data<GetType>(j))) {
-                    return true;
+            if (is_single_target) {
+                for (int j = 0; j < array.length(); ++j) {
+                    if (array.template get_data<GetType>(j) == single_target) {
+                        return true;
+                    }
+                }
+            } else {
+                for (int j = 0; j < array.length(); ++j) {
+                    if (elements->In(array.template get_data<GetType>(j))) {
+                        return true;
+                    }
                 }
             }
             return false;
