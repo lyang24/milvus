@@ -18,3 +18,24 @@ add_executable(fastmem_benchmark FastMemBenchmark.cpp)
 target_include_directories(fastmem_benchmark PRIVATE ${CMAKE_HOME_DIRECTORY}/src)
 target_link_libraries(fastmem_benchmark PRIVATE benchmark::benchmark)
 install(TARGETS fastmem_benchmark DESTINATION benchmark)
+
+add_executable(prepared_field_reader_benchmark PreparedFieldReaderBenchmark.cpp)
+target_include_directories(
+    prepared_field_reader_benchmark
+    PRIVATE
+        ${CMAKE_HOME_DIRECTORY}/src
+        ${CMAKE_HOME_DIRECTORY}/thirdparty/tantivy
+        ${CMAKE_HOME_DIRECTORY}/thirdparty/tantivy/tantivy-binding/include
+        ${CMAKE_HOME_DIRECTORY}/unittest
+        ${CMAKE_HOME_DIRECTORY}/../parser/planparserv2/cwrapper
+)
+target_link_libraries(
+    prepared_field_reader_benchmark
+    PRIVATE
+        benchmark::benchmark
+        milvus_core
+        milvus_conan_deps
+        knowhere
+        milvus-storage
+)
+install(TARGETS prepared_field_reader_benchmark DESTINATION benchmark)

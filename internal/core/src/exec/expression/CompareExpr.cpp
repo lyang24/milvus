@@ -282,6 +282,14 @@ PhyCompareFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
 
     auto input = context.get_offset_input();
     SetHasOffsetInput((input != nullptr));
+    const auto has_prepared_readers =
+        !std::holds_alternative<std::monostate>(prepared_left_reader_) &&
+        !std::holds_alternative<std::monostate>(prepared_right_reader_);
+    if (has_prepared_readers &&
+        (has_offset_input_ || is_left_indexed_ || is_right_indexed_)) {
+        result = ExecCompareExprDispatcherForPreparedFields(context);
+        return;
+    }
     // For segment both fields has no index, can use SIMD to speed up.
     // Avoiding too much call stack that blocks SIMD.
     if (CanUseBothDataFastPath()) {
@@ -289,6 +297,131 @@ PhyCompareFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
         return;
     }
     result = ExecCompareExprDispatcherForHybridSegment(context);
+}
+
+VectorPtr
+PhyCompareFilterExpr::ExecCompareExprDispatcherForPreparedFields(
+    EvalCtx& context) {
+    switch (expr_->left_data_type_) {
+        case DataType::BOOL:
+            return ExecComparePreparedLeftType<bool>(context);
+        case DataType::INT8:
+            return ExecComparePreparedLeftType<int8_t>(context);
+        case DataType::INT16:
+            return ExecComparePreparedLeftType<int16_t>(context);
+        case DataType::INT32:
+            return ExecComparePreparedLeftType<int32_t>(context);
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            return ExecComparePreparedLeftType<int64_t>(context);
+        case DataType::FLOAT:
+            return ExecComparePreparedLeftType<float>(context);
+        case DataType::DOUBLE:
+            return ExecComparePreparedLeftType<double>(context);
+        default:
+            ThrowInfo(UnexpectedError,
+                      "unsupported prepared left datatype: {}",
+                      expr_->left_data_type_);
+    }
+}
+
+template <typename T>
+VectorPtr
+PhyCompareFilterExpr::ExecComparePreparedLeftType(EvalCtx& context) {
+    switch (expr_->right_data_type_) {
+        case DataType::BOOL:
+            return ExecComparePreparedRightType<T, bool>(context);
+        case DataType::INT8:
+            return ExecComparePreparedRightType<T, int8_t>(context);
+        case DataType::INT16:
+            return ExecComparePreparedRightType<T, int16_t>(context);
+        case DataType::INT32:
+            return ExecComparePreparedRightType<T, int32_t>(context);
+        case DataType::INT64:
+        case DataType::TIMESTAMPTZ:
+            return ExecComparePreparedRightType<T, int64_t>(context);
+        case DataType::FLOAT:
+            return ExecComparePreparedRightType<T, float>(context);
+        case DataType::DOUBLE:
+            return ExecComparePreparedRightType<T, double>(context);
+        default:
+            ThrowInfo(UnexpectedError,
+                      "unsupported prepared right datatype: {}",
+                      expr_->right_data_type_);
+    }
+}
+
+template <typename T, typename U>
+VectorPtr
+PhyCompareFilterExpr::ExecComparePreparedRightType(EvalCtx& context) {
+    auto input = context.get_offset_input();
+    auto real_batch_size =
+        has_offset_input_ ? input->size() : GetNextBatchSize();
+    if (real_batch_size == 0) {
+        return nullptr;
+    }
+
+    auto left_reader =
+        std::get_if<segcore::PreparedFieldReader<T>>(&prepared_left_reader_);
+    auto right_reader =
+        std::get_if<segcore::PreparedFieldReader<U>>(&prepared_right_reader_);
+    AssertInfo(left_reader != nullptr && right_reader != nullptr,
+               "prepared compare reader type mismatch");
+    auto left_values = left_reader->ScratchValues(real_batch_size);
+    auto right_values = right_reader->ScratchValues(real_batch_size);
+    auto& left_validity = left_reader->ScratchValidity(real_batch_size);
+    auto& right_validity = right_reader->ScratchValidity(real_batch_size);
+
+    if (has_offset_input_) {
+        left_reader->Gather(
+            input->data(), real_batch_size, left_values, left_validity);
+        right_reader->Gather(
+            input->data(), real_batch_size, right_values, right_validity);
+    } else {
+        const auto start = GetCurrentRows();
+        left_reader->GatherRange(
+            start, real_batch_size, left_values, left_validity);
+        right_reader->GatherRange(
+            start, real_batch_size, right_values, right_validity);
+        MoveCursor();
+    }
+
+    TargetBitmap result(real_batch_size, false);
+    TargetBitmap validity = left_validity.clone();
+    validity &= right_validity;
+    auto evaluate = [&](const auto& op) {
+        for (int64_t i = 0; i < real_batch_size; ++i) {
+            if (validity[i]) {
+                result[i] = op(left_values[i], right_values[i]);
+            }
+        }
+    };
+    switch (expr_->op_type_) {
+        case OpType::Equal:
+            evaluate(std::equal_to<>{});
+            break;
+        case OpType::NotEqual:
+            evaluate(std::not_equal_to<>{});
+            break;
+        case OpType::GreaterEqual:
+            evaluate(std::greater_equal<>{});
+            break;
+        case OpType::GreaterThan:
+            evaluate(std::greater<>{});
+            break;
+        case OpType::LessEqual:
+            evaluate(std::less_equal<>{});
+            break;
+        case OpType::LessThan:
+            evaluate(std::less<>{});
+            break;
+        default:
+            ThrowInfo(UnexpectedError,
+                      "unsupported prepared compare operator: {}",
+                      expr_->op_type_);
+    }
+    return std::make_shared<ColumnVector>(std::move(result),
+                                          std::move(validity));
 }
 
 VectorPtr
@@ -399,14 +532,15 @@ PhyCompareFilterExpr::ExecCompareRightType(EvalCtx& context) {
 
     auto expr_type = expr_->op_type_;
     size_t processed_cursor = 0;
-    auto execute_sub_batch =
-        [ expr_type, &bitmap_input, &
-          processed_cursor ]<FilterType filter_type = FilterType::sequential>(
-            const T* left,
-            const U* right,
-            const int32_t* offsets,
-            const int size,
-            TargetBitmapView res) {
+    auto execute_sub_batch = [expr_type,
+                              &bitmap_input,
+                              &processed_cursor]<FilterType filter_type =
+                                                     FilterType::sequential>(
+                                 const T* left,
+                                 const U* right,
+                                 const int32_t* offsets,
+                                 const int size,
+                                 TargetBitmapView res) {
         switch (expr_type) {
             case proto::plan::GreaterThan: {
                 CompareElementFunc<T, U, proto::plan::GreaterThan, filter_type>

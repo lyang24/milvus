@@ -243,6 +243,23 @@ get_bit_if_present(const BitsetType& bitset, FieldId field_id) {
     return pos >= 0 && static_cast<size_t>(pos) < bitset.size() && bitset[pos];
 }
 
+PreparedFieldDataSource
+ChunkedSegmentSealedImpl::GetPreparedFieldDataSource(FieldId field_id) const {
+    auto snapshot = CapturePublishedState();
+    AssertInfo(snapshot != nullptr && snapshot->runtime != nullptr,
+               "field {} has no published runtime for prepared reads",
+               field_id.get());
+    PreparedFieldDataSource source;
+    source.sealed_column = get_column(snapshot->runtime, field_id);
+    if (source.sealed_column != nullptr) {
+        AssertInfo(
+            get_bit_if_present(snapshot->field_data_ready_bitset, field_id),
+            "field {} is not ready for prepared reads",
+            field_id.get());
+    }
+    return source;
+}
+
 static inline bool
 field_exists_in_schema(const SchemaPtr& schema, FieldId field_id) {
     return field_id.get() < START_USER_FIELDID ||

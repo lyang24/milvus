@@ -2509,8 +2509,10 @@ SegmentGrowingImpl::bulk_subscript(milvus::OpContext* op_ctx,
     valid_map.set();
     if (field_meta.is_nullable()) {
         auto valid_vec_ptr = insert_record_.get_valid_data(field_id);
+        auto validity = std::make_unique<bool[]>(count);
+        valid_vec_ptr->bulk_is_valid(seg_offsets, count, validity.get());
         for (auto i = 0; i < count; i++) {
-            valid_map.set(i, valid_vec_ptr->is_valid(seg_offsets[i]));
+            valid_map.set(i, validity[i]);
         }
     }
 

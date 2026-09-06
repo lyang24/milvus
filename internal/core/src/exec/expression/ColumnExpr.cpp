@@ -84,6 +84,12 @@ PhyColumnExpr::DoEval(OffsetVector* input) {
     AssertInfo(!expr_->GetColumn().element_level_,
                "ColumnExpr of row-level access is not supported");
 
+    if constexpr (std::is_fundamental_v<T>) {
+        if (has_offset_input_ || use_index_data_) {
+            return DoEvalPrepared<T>(input);
+        }
+    }
+
     // similar to PhyCompareFilterExpr::ExecCompareExprDispatcher(OpType op)
     // take offsets as input
     if (has_offset_input_) {
@@ -220,6 +226,37 @@ PhyColumnExpr::DoEval(OffsetVector* input) {
         }
         return res_vec;
     }
+}
+
+template <typename T>
+VectorPtr
+PhyColumnExpr::DoEvalPrepared(OffsetVector* input) {
+    auto real_batch_size =
+        has_offset_input_ ? input->size() : GetNextBatchSize();
+    if (real_batch_size == 0) {
+        return nullptr;
+    }
+
+    auto res_vec = std::make_shared<ColumnVector>(expr_->GetColumn().data_type_,
+                                                  real_batch_size);
+    auto values = res_vec->RawAsValues<T>();
+    TargetBitmapView validity(res_vec->GetValidRawData(), real_batch_size);
+    validity.set();
+    auto reader =
+        std::get_if<segcore::PreparedFieldReader<T>>(&prepared_reader_);
+    AssertInfo(reader != nullptr,
+               "prepared reader type mismatch for field {}",
+               expr_->GetColumn().field_id_.get());
+
+    if (has_offset_input_) {
+        reader->Gather(input->data(), real_batch_size, values, validity);
+    } else {
+        reader->GatherRange(
+            GetCurrentRows(), real_batch_size, values, validity);
+        MoveCursor();
+    }
+
+    return res_vec;
 }
 
 }  //namespace exec

@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "common/Common.h"
@@ -25,6 +26,7 @@
 #include "common/IndexMeta.h"
 #include "common/Schema.h"
 #include "expr/ITypeExpr.h"
+#include "index/ScalarIndexSort.h"
 #include "knowhere/comp/index_param.h"
 #include "pb/plan.pb.h"
 #include "query/ExecPlanNodeVisitor.h"
@@ -34,6 +36,7 @@
 #include "segcore/SegmentGrowingImpl.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/SegcoreConfigUtils.h"
+#include "test_utils/storage_test_utils.h"
 
 namespace milvus::segcore {
 
@@ -56,6 +59,118 @@ TEST(SegmentChunkReader, StringVariantMismatchIsSystemError) {
         FAIL() << "expected a variant type mismatch";
     } catch (const SegcoreError& error) {
         EXPECT_EQ(error.get_error_code(), ErrorCode::UnexpectedError);
+    }
+}
+
+TEST(SegmentChunkReader, PreparedReaderGathersTypedGrowingValues) {
+    constexpr int64_t kRowCount = 32;
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    auto value_field =
+        schema->AddDebugField("value", DataType::INT32, /*nullable=*/true);
+
+    auto raw_data = DataGen(schema, kRowCount);
+    auto expected = raw_data.get_col<int32_t>(value_field);
+    auto expected_validity = raw_data.get_col_valid(value_field);
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+    segment->PreInsert(kRowCount);
+    segment->Insert(0,
+                    kRowCount,
+                    raw_data.row_ids_.data(),
+                    raw_data.timestamps_.data(),
+                    raw_data.raw_);
+
+    PreparedFieldReader<int32_t> reader(
+        nullptr, segment.get(), kRowCount, value_field, {});
+    const std::vector<int64_t> offsets = {17, 2, 31, 0, 9};
+    std::vector<int32_t> values(offsets.size());
+    TargetBitmap validity(offsets.size(), false);
+    reader.Gather(offsets.data(), offsets.size(), values.data(), validity);
+
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        EXPECT_EQ(validity[i], expected_validity[offsets[i]]);
+        if (validity[i]) {
+            EXPECT_EQ(values[i], expected[offsets[i]]);
+        }
+    }
+
+    constexpr int64_t kRangeStart = 7;
+    constexpr int64_t kRangeSize = 8;
+    values.resize(kRangeSize);
+    validity = TargetBitmap(kRangeSize, false);
+    reader.GatherRange(kRangeStart, kRangeSize, values.data(), validity);
+    for (int64_t i = 0; i < kRangeSize; ++i) {
+        EXPECT_EQ(validity[i], expected_validity[kRangeStart + i]);
+        if (validity[i]) {
+            EXPECT_EQ(values[i], expected[kRangeStart + i]);
+        }
+    }
+}
+
+TEST(SegmentChunkReader, PreparedReaderRetainsTypedSealedColumn) {
+    constexpr int64_t kRowCount = 32;
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    auto value_field =
+        schema->AddDebugField("value", DataType::INT32, /*nullable=*/true);
+
+    auto raw_data = DataGen(schema, kRowCount);
+    auto expected = raw_data.get_col<int32_t>(value_field);
+    auto expected_validity = raw_data.get_col_valid(value_field);
+    auto segment = CreateSealedWithFieldDataLoaded(schema, raw_data);
+
+    PreparedFieldReader<int32_t> reader(
+        nullptr, segment.get(), kRowCount, value_field, {});
+    segment->DropFieldData(value_field);
+    EXPECT_FALSE(segment->HasFieldData(value_field));
+    const std::vector<int64_t> offsets = {31, 4, 18, 0, 7};
+    std::vector<int32_t> values(offsets.size());
+    TargetBitmap validity(offsets.size(), false);
+    reader.Gather(offsets.data(), offsets.size(), values.data(), validity);
+
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        EXPECT_EQ(validity[i], expected_validity[offsets[i]]);
+        if (validity[i]) {
+            EXPECT_EQ(values[i], expected[offsets[i]]);
+        }
+    }
+}
+
+TEST(SegmentChunkReader, PreparedReaderRetainsTypedScalarIndex) {
+    constexpr int64_t kRowCount = 32;
+    auto schema = std::make_shared<Schema>();
+    auto pk = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk);
+    auto value_field =
+        schema->AddDebugField("value", DataType::INT32, /*nullable=*/true);
+
+    auto raw_data = DataGen(schema, kRowCount);
+    auto expected = raw_data.get_col<int32_t>(value_field);
+    auto expected_validity = raw_data.get_col_valid(value_field);
+    auto scalar_index = index::CreateScalarIndexSort<int32_t>();
+    scalar_index->Build(kRowCount, expected.data(), expected_validity.data());
+    std::vector<PinWrapper<const index::IndexBase*>> pinned_index;
+    pinned_index.emplace_back(scalar_index.get());
+    auto segment = CreateGrowingSegment(schema, empty_index_meta);
+
+    PreparedFieldReader<int32_t> reader(
+        nullptr,
+        segment.get(),
+        kRowCount,
+        value_field,
+        {pinned_index.data(), pinned_index.size()});
+    const std::vector<int64_t> offsets = {22, 1, 30, 9, 5};
+    std::vector<int32_t> values(offsets.size());
+    TargetBitmap validity(offsets.size(), false);
+    reader.Gather(offsets.data(), offsets.size(), values.data(), validity);
+
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        EXPECT_EQ(validity[i], expected_validity[offsets[i]]);
+        if (validity[i]) {
+            EXPECT_EQ(values[i], expected[offsets[i]]);
+        }
     }
 }
 

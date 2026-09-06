@@ -98,6 +98,37 @@ class FixedVectorIterator : public VectorIterator {
 
 const char* METRICS_TYPE = "metric_type";
 
+TEST(CompositeGroupByMap, TracksMinimumAcceptedResultsToCompletion) {
+    CompositeGroupKey first_key;
+    first_key.Add(GroupByValueType{int64_t{1}});
+    CompositeGroupKey second_key;
+    second_key.Add(GroupByValueType{int64_t{2}});
+
+    CompositeGroupByMap non_strict(/*group_capacity=*/2,
+                                   /*group_size=*/3,
+                                   /*strict_group_size=*/false);
+    EXPECT_EQ(non_strict.MinAcceptedResultsToComplete(), 2);
+    EXPECT_TRUE(non_strict.Push(first_key));
+    EXPECT_EQ(non_strict.MinAcceptedResultsToComplete(), 1);
+    EXPECT_TRUE(non_strict.Push(first_key));
+    EXPECT_EQ(non_strict.MinAcceptedResultsToComplete(), 1);
+    EXPECT_TRUE(non_strict.Push(second_key));
+    EXPECT_EQ(non_strict.MinAcceptedResultsToComplete(), 0);
+
+    CompositeGroupByMap strict(/*group_capacity=*/2,
+                               /*group_size=*/2,
+                               /*strict_group_size=*/true);
+    EXPECT_EQ(strict.MinAcceptedResultsToComplete(), 4);
+    EXPECT_TRUE(strict.Push(first_key));
+    EXPECT_TRUE(strict.Push(second_key));
+    EXPECT_EQ(strict.MinAcceptedResultsToComplete(), 2);
+    EXPECT_TRUE(strict.Push(first_key));
+    EXPECT_EQ(strict.MinAcceptedResultsToComplete(), 1);
+    EXPECT_TRUE(strict.Push(second_key));
+    EXPECT_EQ(strict.MinAcceptedResultsToComplete(), 0);
+    EXPECT_TRUE(strict.IsGroupResEnough());
+}
+
 TEST(GroupBY, SealedIndex) {
     using namespace milvus;
     using namespace milvus::query;

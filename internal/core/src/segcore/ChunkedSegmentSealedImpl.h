@@ -136,6 +136,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     HasJsonIndex(FieldId field_id) const override;
     bool
     HasFieldData(FieldId field_id) const override;
+
+    PreparedFieldDataSource
+    GetPreparedFieldDataSource(FieldId field_id) const override;
     // Checks the loaded external manifest for a storage column.
     bool
     HasColumnInLoadedManifest(const std::string& column_name) const override;

@@ -39,11 +39,19 @@ struct GroupedResult {
     CompositeGroupKey group_key;
 };
 
+struct GroupCandidate {
+    int64_t row_offset;
+    int32_t element_index;
+    float distance;
+};
+
+constexpr size_t kGroupCandidateBatchSize = 128;
+
 }  // namespace
 
 // Helper to create a single-field getter that returns GroupByValueType
 template <typename T, typename InnerRawType = T>
-static std::function<GroupByValueType(int64_t)>
+static MultiFieldDataGetter::FieldGetter
 CreateFieldGetter(milvus::OpContext* op_ctx,
                   const segcore::SegmentInternalInterface& segment,
                   FieldId field_id,
@@ -52,8 +60,23 @@ CreateFieldGetter(milvus::OpContext* op_ctx,
                   bool strict_cast = false) {
     auto getter = GetDataGetter<T, InnerRawType>(
         op_ctx, segment, field_id, json_path, json_type, strict_cast);
-    return
-        [getter](int64_t idx) -> GroupByValueType { return getter->Get(idx); };
+    auto batch_values = std::make_shared<std::vector<std::optional<T>>>();
+    return MultiFieldDataGetter::FieldGetter{
+        [getter](int64_t idx) -> GroupByValueType { return getter->Get(idx); },
+        [getter, batch_values](const int64_t* offsets,
+                               int64_t count,
+                               std::vector<GroupByValueType>& out) {
+            getter->GetBatch(offsets, count, *batch_values);
+            out.resize(count);
+            for (int64_t i = 0; i < count; ++i) {
+                if ((*batch_values)[i].has_value()) {
+                    out[i] = std::move((*batch_values)[i].value());
+                } else {
+                    out[i] = std::nullopt;
+                }
+            }
+        },
+        getter->SupportsBatchRead()};
 }
 
 MultiFieldDataGetter::MultiFieldDataGetter(
@@ -68,7 +91,7 @@ MultiFieldDataGetter::MultiFieldDataGetter(
 
     for (const auto& field_id : field_ids) {
         auto data_type = segment.GetFieldDataType(field_id);
-        std::function<GroupByValueType(int64_t)> getter;
+        MultiFieldDataGetter::FieldGetter getter;
 
         switch (data_type) {
             case DataType::INT8:
@@ -171,6 +194,7 @@ MultiFieldDataGetter::MultiFieldDataGetter(
                               "unsupported data type {} for group by operator",
                               data_type));
         }
+        supports_batch_read_ &= getter.supports_batch_read;
         getters_.push_back(std::move(getter));
     }
 }
@@ -180,7 +204,28 @@ MultiFieldDataGetter::GetInto(int64_t idx, CompositeGroupKey& out) const {
     out.Clear();
     out.Reserve(field_count_);
     for (const auto& getter : getters_) {
-        out.Add(getter(idx));
+        out.Add(getter.get(idx));
+    }
+}
+
+void
+MultiFieldDataGetter::GetIntoBatch(const int64_t* offsets,
+                                   int64_t count,
+                                   std::vector<CompositeGroupKey>& out) const {
+    AssertInfo(supports_batch_read_,
+               "batch group-by read requires fixed-width scalar fields");
+    out.clear();
+    out.resize(count);
+    for (auto& key : out) {
+        key.Reserve(field_count_);
+    }
+
+    std::vector<GroupByValueType> values;
+    for (const auto& getter : getters_) {
+        getter.get_batch(offsets, count, values);
+        for (int64_t i = 0; i < count; ++i) {
+            out[i].Add(std::move(values[i]));
+        }
     }
 }
 
@@ -203,39 +248,96 @@ GroupIteratorResult(const std::shared_ptr<VectorIterator>& iterator,
     auto is_element_id = search_info.element_level();
     AssertInfo(element_indices == nullptr || is_element_id,
                "element_indices output requires element-level search");
+    AssertInfo(!is_element_id || search_info.array_offsets_ != nullptr,
+               "Array offsets not available for element-level search");
 
     //2. do iteration until fill the whole map or run out of all data
     //note it may enumerate all data inside a segment and can block following
     //query and search possibly
     std::vector<GroupedResult> res;
-    CompositeGroupKey scratch_key;
-    while (iterator->HasNext() && !groupMap.IsGroupResEnough()) {
-        auto offset_dis_pair = iterator->Next();
-        AssertInfo(offset_dis_pair.has_value(),
-                   "Wrong state! iterator cannot return valid result whereas "
-                   "it still tells hasNext");
-        auto raw_offset = offset_dis_pair.value().first;
-        auto dis = offset_dis_pair.value().second;
+    if (data_getter->SupportsBatchRead()) {
+        std::vector<GroupCandidate> candidates;
+        std::vector<int64_t> candidate_offsets;
+        std::vector<CompositeGroupKey> candidate_keys;
+        candidates.reserve(kGroupCandidateBatchSize);
+        candidate_offsets.reserve(kGroupCandidateBatchSize);
+        candidate_keys.reserve(kGroupCandidateBatchSize);
 
-        // For element-level search, the offset is the element_id, we need to convert it to the row_id.
-        int64_t row_offset = raw_offset;
-        int32_t element_index = -1;
-        if (is_element_id) {
-            AssertInfo(search_info.array_offsets_ != nullptr,
-                       "Array offsets not available for element-level search");
-            auto [doc_id, elem_idx] =
-                search_info.array_offsets_->ElementIDToRowID(
-                    static_cast<int32_t>(raw_offset));
-            row_offset = doc_id;
-            element_index = elem_idx;
+        while (iterator->HasNext() && !groupMap.IsGroupResEnough()) {
+            const auto candidate_batch_size = std::max<size_t>(
+                1,
+                std::min(kGroupCandidateBatchSize,
+                         groupMap.MinAcceptedResultsToComplete()));
+            candidates.clear();
+            candidate_offsets.clear();
+            while (iterator->HasNext() &&
+                   candidates.size() < candidate_batch_size) {
+                auto offset_dis_pair = iterator->Next();
+                AssertInfo(
+                    offset_dis_pair.has_value(),
+                    "Wrong state! iterator cannot return valid result whereas "
+                    "it still tells hasNext");
+                auto [raw_offset, distance] = offset_dis_pair.value();
+                int64_t row_offset = raw_offset;
+                int32_t element_index = -1;
+                if (is_element_id) {
+                    auto [doc_id, elem_idx] =
+                        search_info.array_offsets_->ElementIDToRowID(
+                            static_cast<int32_t>(raw_offset));
+                    row_offset = doc_id;
+                    element_index = elem_idx;
+                }
+                candidates.emplace_back(
+                    GroupCandidate{row_offset, element_index, distance});
+                candidate_offsets.emplace_back(row_offset);
+            }
+
+            data_getter->GetIntoBatch(candidate_offsets.data(),
+                                      candidate_offsets.size(),
+                                      candidate_keys);
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                if (groupMap.Push(candidate_keys[i])) {
+                    res.emplace_back(
+                        GroupedResult{candidates[i].row_offset,
+                                      candidates[i].element_index,
+                                      candidates[i].distance,
+                                      std::move(candidate_keys[i])});
+                }
+                if (groupMap.IsGroupResEnough()) {
+                    break;
+                }
+            }
         }
+    } else {
+        CompositeGroupKey scratch_key;
+        while (iterator->HasNext() && !groupMap.IsGroupResEnough()) {
+            auto offset_dis_pair = iterator->Next();
+            AssertInfo(
+                offset_dis_pair.has_value(),
+                "Wrong state! iterator cannot return valid result whereas "
+                "it still tells hasNext");
+            auto raw_offset = offset_dis_pair.value().first;
+            auto dis = offset_dis_pair.value().second;
 
-        data_getter->GetInto(row_offset, scratch_key);
-        if (groupMap.Push(scratch_key)) {
-            // Safe to move: next iteration's GetInto() will Clear+Reserve+Add
-            // on the moved-from small_vector, which is guaranteed empty-inline.
-            res.emplace_back(GroupedResult{
-                row_offset, element_index, dis, std::move(scratch_key)});
+            // For element-level search, the offset is the element_id, we need to convert it to the row_id.
+            int64_t row_offset = raw_offset;
+            int32_t element_index = -1;
+            if (is_element_id) {
+                auto [doc_id, elem_idx] =
+                    search_info.array_offsets_->ElementIDToRowID(
+                        static_cast<int32_t>(raw_offset));
+                row_offset = doc_id;
+                element_index = elem_idx;
+            }
+
+            data_getter->GetInto(row_offset, scratch_key);
+            if (groupMap.Push(scratch_key)) {
+                // Safe to move: next iteration's GetInto() will
+                // Clear+Reserve+Add on the moved-from small_vector, which is
+                // guaranteed empty-inline.
+                res.emplace_back(GroupedResult{
+                    row_offset, element_index, dis, std::move(scratch_key)});
+            }
         }
     }
 

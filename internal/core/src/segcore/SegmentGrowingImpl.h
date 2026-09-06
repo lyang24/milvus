@@ -203,6 +203,16 @@ class SegmentGrowingImpl : public SegmentGrowing {
         return insert_record_;
     }
 
+    PreparedFieldDataSource
+    GetPreparedFieldDataSource(FieldId field_id) const override {
+        PreparedFieldDataSource source;
+        source.growing_data = insert_record_.get_data_base(field_id);
+        if (insert_record_.is_valid_data_exist(field_id)) {
+            source.growing_validity = insert_record_.get_valid_data(field_id);
+        }
+        return source;
+    }
+
     const IndexingRecord&
     get_indexing_record() const {
         return indexing_record_;

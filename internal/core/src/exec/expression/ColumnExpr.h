@@ -73,6 +73,13 @@ class PhyColumnExpr : public Expr {
                              : upper_div(segment_chunk_reader_.active_count_,
                                          segment_chunk_reader_.SizePerChunk());
         }
+        prepared_reader_ =
+            segcore::PrepareFieldReader(op_ctx_,
+                                        segment,
+                                        active_count,
+                                        expr_->GetColumn().data_type_,
+                                        expr_->GetColumn().field_id_,
+                                        PinnedIndexForRawLookup());
         AssertInfo(
             batch_size_ > 0,
             fmt::format("expr batch size should greater than zero, but now: {}",
@@ -143,6 +150,10 @@ class PhyColumnExpr : public Expr {
     VectorPtr
     DoEval(OffsetVector* input = nullptr);
 
+    template <typename T>
+    VectorPtr
+    DoEvalPrepared(OffsetVector* input);
+
     std::string
     ToString() const override {
         return fmt::format("{}", expr_->ToString());
@@ -182,6 +193,7 @@ class PhyColumnExpr : public Expr {
     int64_t batch_size_;
     std::shared_ptr<const milvus::expr::ColumnExpr> expr_;
     std::vector<PinWrapper<const index::IndexBase*>> pinned_index_;
+    segcore::PreparedFieldReaderVariant prepared_reader_;
 };
 
 }  //namespace exec

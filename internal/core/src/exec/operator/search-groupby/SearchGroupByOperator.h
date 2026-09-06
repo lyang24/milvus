@@ -43,6 +43,7 @@
 #include "knowhere/comp/index_param.h"
 #include "segcore/ConcurrentVector.h"
 #include "segcore/InsertRecord.h"
+#include "segcore/SegmentChunkReader.h"
 #include "segcore/SegmentGrowingImpl.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/SegmentSealed.h"
@@ -113,6 +114,21 @@ class DataGetter {
     virtual std::optional<T>
     Get(int64_t idx) const = 0;
 
+    virtual void
+    GetBatch(const int64_t* offsets,
+             int64_t count,
+             std::vector<std::optional<T>>& out) const {
+        out.resize(count);
+        for (int64_t i = 0; i < count; ++i) {
+            out[i] = Get(offsets[i]);
+        }
+    }
+
+    virtual bool
+    SupportsBatchRead() const {
+        return false;
+    }
+
  protected:
     std::optional<std::string> json_path_;
     bool specific_json_type_ = false;
@@ -127,7 +143,8 @@ class GrowingDataGetter : public DataGetter<OutputType> {
                       FieldId fieldId,
                       std::optional<std::string> json_path,
                       std::optional<DataType> json_type,
-                      bool strict_cast) {
+                      bool strict_cast)
+        : op_ctx_(op_ctx), segment_(segment), field_id_(fieldId) {
         growing_raw_data_ =
             segment.get_insert_record().get_data<InnerRawType>(fieldId);
         valid_data_ = segment.get_insert_record().is_valid_data_exist(fieldId)
@@ -136,6 +153,13 @@ class GrowingDataGetter : public DataGetter<OutputType> {
         this->json_path_ = json_path;
         this->specific_json_type_ = json_type.has_value();
         this->strict_cast_ = strict_cast;
+        prepared_reader_ =
+            segcore::PrepareFieldReader(op_ctx_,
+                                        &segment_,
+                                        segment_.get_row_count(),
+                                        segment_.GetFieldDataType(field_id_),
+                                        field_id_,
+                                        {});
     }
 
     std::optional<OutputType>
@@ -174,9 +198,43 @@ class GrowingDataGetter : public DataGetter<OutputType> {
         }
     }
 
+    void
+    GetBatch(const int64_t* offsets,
+             int64_t count,
+             std::vector<std::optional<OutputType>>& out) const override {
+        if constexpr (std::is_fundamental_v<OutputType> &&
+                      std::is_same_v<OutputType, InnerRawType>) {
+            out.resize(count);
+            auto reader = std::get_if<segcore::PreparedFieldReader<OutputType>>(
+                &prepared_reader_);
+            AssertInfo(reader != nullptr,
+                       "prepared group-by reader type mismatch for field {}",
+                       field_id_.get());
+            auto values = reader->ScratchValues(count);
+            auto& validity = reader->ScratchValidity(count);
+            reader->Gather(offsets, count, values, validity);
+            for (int64_t i = 0; i < count; ++i) {
+                out[i] = validity[i] ? std::optional<OutputType>(values[i])
+                                     : std::nullopt;
+            }
+        } else {
+            DataGetter<OutputType>::GetBatch(offsets, count, out);
+        }
+    }
+
+    bool
+    SupportsBatchRead() const override {
+        return std::is_fundamental_v<OutputType> &&
+               std::is_same_v<OutputType, InnerRawType>;
+    }
+
  protected:
+    milvus::OpContext* op_ctx_;
+    const segcore::SegmentGrowingImpl& segment_;
+    const FieldId field_id_;
     const segcore::ConcurrentVector<InnerRawType>* growing_raw_data_;
     segcore::ThreadSafeValidDataPtr valid_data_;
+    mutable segcore::PreparedFieldReaderVariant prepared_reader_;
 };
 
 template <typename OutputType, typename InnerRawType = OutputType>
@@ -199,6 +257,7 @@ class SealedDataGetter : public DataGetter<OutputType> {
         str_pw_map;
 
     PinWrapper<const index::IndexBase*> index_ptr_;
+    const index::ScalarIndex<OutputType>* index_data_{nullptr};
     // Getting str_view from segment is cpu-costly, this map is to cache this view for performance.
     // Shares the same single-thread contract as str_pw_map above.
     mutable std::unordered_map<
@@ -226,10 +285,22 @@ class SealedDataGetter : public DataGetter<OutputType> {
                     segment_.get_segment_id());
             }
             index_ptr_ = std::move(index[0]);
+            index_data_ = dynamic_cast<const index::ScalarIndex<OutputType>*>(
+                index_ptr_.get());
         }
         this->json_path_ = json_path;
         this->specific_json_type_ = json_type.has_value();
         this->strict_cast_ = strict_cast;
+        auto pinned_index = from_data_
+                                ? segcore::PinnedIndexView{}
+                                : segcore::PinnedIndexView(&index_ptr_, 1);
+        prepared_reader_ =
+            segcore::PrepareFieldReader(op_ctx_,
+                                        &segment_,
+                                        segment_.get_row_count(),
+                                        segment_.GetFieldDataType(field_id_),
+                                        field_id_,
+                                        pinned_index);
     }
 
     std::optional<OutputType>
@@ -285,14 +356,11 @@ class SealedDataGetter : public DataGetter<OutputType> {
             AssertInfo(index_ptr_.get() != nullptr,
                        "indexed field {} has no valid index pointer",
                        field_id_.get());
-            auto chunk_index =
-                dynamic_cast<const index::ScalarIndex<OutputType>*>(
-                    index_ptr_.get());
-            AssertInfo(chunk_index != nullptr,
+            AssertInfo(index_data_ != nullptr,
                        "index type mismatch for field {}: expected "
                        "ScalarIndex<OutputType>",
                        field_id_.get());
-            auto raw = chunk_index->Reverse_Lookup(idx);
+            auto raw = index_data_->Reverse_Lookup(idx);
             // A null row has no value in the index (Reverse_Lookup ==
             // nullopt). Return nullopt so it forms a distinct null group,
             // consistent with the from-data getter branches above — instead
@@ -303,6 +371,39 @@ class SealedDataGetter : public DataGetter<OutputType> {
             return raw.value();
         }
     }
+
+    void
+    GetBatch(const int64_t* offsets,
+             int64_t count,
+             std::vector<std::optional<OutputType>>& out) const override {
+        if constexpr (std::is_fundamental_v<OutputType> &&
+                      std::is_same_v<OutputType, InnerRawType>) {
+            out.resize(count);
+            auto reader = std::get_if<segcore::PreparedFieldReader<OutputType>>(
+                &prepared_reader_);
+            AssertInfo(reader != nullptr,
+                       "prepared group-by reader type mismatch for field {}",
+                       field_id_.get());
+            auto values = reader->ScratchValues(count);
+            auto& validity = reader->ScratchValidity(count);
+            reader->Gather(offsets, count, values, validity);
+            for (int64_t i = 0; i < count; ++i) {
+                out[i] = validity[i] ? std::optional<OutputType>(values[i])
+                                     : std::nullopt;
+            }
+        } else {
+            DataGetter<OutputType>::GetBatch(offsets, count, out);
+        }
+    }
+
+    bool
+    SupportsBatchRead() const override {
+        return std::is_fundamental_v<OutputType> &&
+               std::is_same_v<OutputType, InnerRawType>;
+    }
+
+ private:
+    mutable segcore::PreparedFieldReaderVariant prepared_reader_;
 };
 
 template <typename OutputType, typename InnerRawType = OutputType>
@@ -351,6 +452,7 @@ struct CompositeGroupByMap {
     int group_size_{0};
     int enough_group_count_{0};
     bool strict_group_size_{false};
+    size_t accepted_result_count_{0};
 
  public:
     CompositeGroupByMap(int group_capacity,
@@ -376,6 +478,19 @@ struct CompositeGroupByMap {
         return enough;
     }
 
+    size_t
+    MinAcceptedResultsToComplete() const {
+        if (strict_group_size_) {
+            const auto target = static_cast<size_t>(group_capacity_) *
+                                static_cast<size_t>(group_size_);
+            return target > accepted_result_count_
+                       ? target - accepted_result_count_
+                       : 0;
+        }
+        const auto capacity = static_cast<size_t>(group_capacity_);
+        return capacity > group_map_.size() ? capacity - group_map_.size() : 0;
+    }
+
     bool
     Push(const CompositeGroupKey& key) {
         auto [it, inserted] = group_map_.try_emplace(key, 0);
@@ -389,6 +504,7 @@ struct CompositeGroupByMap {
             return false;
         }
         it->second += 1;
+        accepted_result_count_ += 1;
         if (it->second >= group_size_) {
             enough_group_count_ += 1;
         }
@@ -399,6 +515,14 @@ struct CompositeGroupByMap {
 // Multi-field DataGetter that reads multiple fields and builds CompositeGroupKey
 class MultiFieldDataGetter {
  public:
+    struct FieldGetter {
+        std::function<GroupByValueType(int64_t)> get;
+        std::function<void(
+            const int64_t*, int64_t, std::vector<GroupByValueType>&)>
+            get_batch;
+        bool supports_batch_read{false};
+    };
+
     MultiFieldDataGetter(
         milvus::OpContext* op_ctx,
         const segcore::SegmentInternalInterface& segment,
@@ -410,9 +534,20 @@ class MultiFieldDataGetter {
     void
     GetInto(int64_t idx, CompositeGroupKey& out) const;
 
+    void
+    GetIntoBatch(const int64_t* offsets,
+                 int64_t count,
+                 std::vector<CompositeGroupKey>& out) const;
+
+    bool
+    SupportsBatchRead() const {
+        return supports_batch_read_;
+    }
+
  private:
-    std::vector<std::function<GroupByValueType(int64_t)>> getters_;
+    std::vector<FieldGetter> getters_;
     size_t field_count_;
+    bool supports_batch_read_{true};
 };
 
 // Unified group by interface - always emits CompositeGroupKey

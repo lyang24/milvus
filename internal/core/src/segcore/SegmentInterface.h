@@ -78,6 +78,15 @@ class JsonKeyStats;
 
 namespace milvus::segcore {
 
+// Stable handles to the raw storage selected for a prepared field reader.
+// Growing vectors live for the segment lifetime; sealed columns are retained
+// by shared ownership so reopen/release cannot invalidate an in-flight query.
+struct PreparedFieldDataSource {
+    const VectorBase* growing_data{nullptr};
+    ThreadSafeValidDataPtr growing_validity;
+    std::shared_ptr<ChunkedColumnInterface> sealed_column;
+};
+
 using namespace milvus::cachinglayer;
 
 struct SegmentStats {
@@ -390,6 +399,11 @@ class SegmentInternalInterface : public SegmentInterface {
     // snapshot, so a column replacement and its cache become visible together.
     virtual std::shared_ptr<milvus::exec::SimpleGeometryCache>
     GetGeometryCache(FieldId field_id) const;
+
+    virtual PreparedFieldDataSource
+    GetPreparedFieldDataSource(FieldId field_id) const {
+        return {};
+    }
 
     virtual void
     prefetch_chunks(milvus::OpContext* op_ctx,

@@ -189,6 +189,20 @@ class PhyCompareFilterExpr : public Expr {
                              : upper_div(segment_chunk_reader_.active_count_,
                                          segment_chunk_reader_.SizePerChunk());
         }
+        prepared_left_reader_ =
+            segcore::PrepareFieldReader(op_ctx_,
+                                        segment,
+                                        active_count,
+                                        expr_->left_data_type_,
+                                        left_field_,
+                                        LeftPinnedIndexForRawLookup());
+        prepared_right_reader_ =
+            segcore::PrepareFieldReader(op_ctx_,
+                                        segment,
+                                        active_count,
+                                        expr_->right_data_type_,
+                                        right_field_,
+                                        RightPinnedIndexForRawLookup());
         AssertInfo(
             batch_size_ > 0,
             fmt::format("expr batch size should greater than zero, but now: {}",
@@ -596,6 +610,9 @@ class PhyCompareFilterExpr : public Expr {
     VectorPtr
     ExecCompareExprDispatcherForBothDataSegment(EvalCtx& context);
 
+    VectorPtr
+    ExecCompareExprDispatcherForPreparedFields(EvalCtx& context);
+
     template <typename T>
     VectorPtr
     ExecCompareLeftType(EvalCtx& context);
@@ -603,6 +620,14 @@ class PhyCompareFilterExpr : public Expr {
     template <typename T, typename U>
     VectorPtr
     ExecCompareRightType(EvalCtx& context);
+
+    template <typename T>
+    VectorPtr
+    ExecComparePreparedLeftType(EvalCtx& context);
+
+    template <typename T, typename U>
+    VectorPtr
+    ExecComparePreparedRightType(EvalCtx& context);
 
  private:
     const FieldId left_field_;
@@ -627,6 +652,8 @@ class PhyCompareFilterExpr : public Expr {
     std::shared_ptr<const milvus::expr::CompareExpr> expr_;
     std::vector<PinWrapper<const index::IndexBase*>> pinned_index_left_;
     std::vector<PinWrapper<const index::IndexBase*>> pinned_index_right_;
+    segcore::PreparedFieldReaderVariant prepared_left_reader_;
+    segcore::PreparedFieldReaderVariant prepared_right_reader_;
 };
 }  //namespace exec
 }  // namespace milvus
